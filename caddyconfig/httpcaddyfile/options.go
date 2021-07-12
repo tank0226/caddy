@@ -29,14 +29,17 @@ func init() {
 	RegisterGlobalOption("debug", parseOptTrue)
 	RegisterGlobalOption("http_port", parseOptHTTPPort)
 	RegisterGlobalOption("https_port", parseOptHTTPSPort)
+	RegisterGlobalOption("grace_period", parseOptDuration)
 	RegisterGlobalOption("default_sni", parseOptSingleString)
 	RegisterGlobalOption("order", parseOptOrder)
 	RegisterGlobalOption("storage", parseOptStorage)
+	RegisterGlobalOption("storage_clean_interval", parseOptDuration)
 	RegisterGlobalOption("acme_ca", parseOptSingleString)
 	RegisterGlobalOption("acme_ca_root", parseOptSingleString)
 	RegisterGlobalOption("acme_dns", parseOptACMEDNS)
 	RegisterGlobalOption("acme_eab", parseOptACMEEAB)
 	RegisterGlobalOption("cert_issuer", parseOptCertIssuer)
+	RegisterGlobalOption("skip_install_trust", parseOptTrue)
 	RegisterGlobalOption("email", parseOptSingleString)
 	RegisterGlobalOption("admin", parseOptAdmin)
 	RegisterGlobalOption("on_demand_tls", parseOptOnDemand)
@@ -46,6 +49,7 @@ func init() {
 	RegisterGlobalOption("servers", parseServerOptions)
 	RegisterGlobalOption("ocsp_stapling", parseOCSPStaplingOptions)
 	RegisterGlobalOption("log", parseLogOptions)
+	RegisterGlobalOption("preferred_chains", parseOptPreferredChains)
 }
 
 func parseOptTrue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) { return true, nil }
@@ -175,6 +179,20 @@ func parseOptStorage(d *caddyfile.Dispenser, _ interface{}) (interface{}, error)
 		return nil, d.Errf("module %s is not a caddy.StorageConverter", modID)
 	}
 	return storage, nil
+}
+
+func parseOptDuration(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	if !d.Next() { // consume option name
+		return nil, d.ArgErr()
+	}
+	if !d.Next() { // get duration value
+		return nil, d.ArgErr()
+	}
+	dur, err := caddy.ParseDuration(d.Val())
+	if err != nil {
+		return nil, err
+	}
+	return caddy.Duration(dur), nil
 }
 
 func parseOptACMEDNS(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
@@ -364,8 +382,8 @@ func parseOptAutoHTTPS(d *caddyfile.Dispenser, _ interface{}) (interface{}, erro
 	if d.Next() {
 		return "", d.ArgErr()
 	}
-	if val != "off" && val != "disable_redirects" {
-		return "", d.Errf("auto_https must be either 'off' or 'disable_redirects'")
+	if val != "off" && val != "disable_redirects" && val != "ignore_loaded_certs" {
+		return "", d.Errf("auto_https must be one of 'off', 'disable_redirects' or 'ignore_loaded_certs'")
 	}
 	return val, nil
 }
@@ -434,4 +452,9 @@ func parseLogOptions(d *caddyfile.Dispenser, existingVal interface{}) (interface
 	}
 
 	return configValues, nil
+}
+
+func parseOptPreferredChains(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	d.Next()
+	return caddytls.ParseCaddyfilePreferredChainsOptions(d)
 }

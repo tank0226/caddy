@@ -15,18 +15,15 @@
 package fileserver
 
 import (
-	"bytes"
 	"fmt"
-	"html/template"
-	"io"
 	weakrand "math/rand"
 	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -73,6 +70,10 @@ type FileServer struct {
 
 	// Use redirects to enforce trailing slashes for directories, or to
 	// remove trailing slash from URIs for files. Default is true.
+	//
+	// Canonicalization will not happen if the last element of the request's
+	// path (the filename) is changed in an internal rewrite, to avoid
+	// clobbering the explicit rewrite with implicit behavior.
 	CanonicalURIs *bool `json:"canonical_uris,omitempty"`
 
 	// Override the status code written when successfully serving a file.
@@ -117,23 +118,6 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 
 	if fsrv.IndexNames == nil {
 		fsrv.IndexNames = defaultIndexNames
-	}
-
-	if fsrv.Browse != nil {
-		var tpl *template.Template
-		var err error
-		if fsrv.Browse.TemplateFile != "" {
-			tpl, err = template.ParseFiles(fsrv.Browse.TemplateFile)
-			if err != nil {
-				return fmt.Errorf("parsing browse template file: %v", err)
-			}
-		} else {
-			tpl, err = template.New("default_listing").Parse(defaultBrowseTemplate)
-			if err != nil {
-				return fmt.Errorf("parsing default browse template: %v", err)
-			}
-		}
-		fsrv.Browse.template = tpl
 	}
 
 	// for hide paths that are static (i.e. no placeholders), we can transform them into
@@ -181,7 +165,7 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	filesToHide := fsrv.transformHidePaths(repl)
 
 	root := repl.ReplaceAll(fsrv.Root, ".")
-	filename := sanitizedPathJoin(root, r.URL.Path)
+	filename := caddyhttp.SanitizedPathJoin(root, r.URL.Path)
 
 	fsrv.logger.Debug("sanitized path join",
 		zap.String("site_root", root),
@@ -197,7 +181,6 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		} else if os.IsPermission(err) {
 			return caddyhttp.Error(http.StatusForbidden, err)
 		}
-		// TODO: treat this as resource exhaustion like with os.Open? Or unnecessary here?
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
@@ -206,7 +189,7 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	var implicitIndexFile bool
 	if info.IsDir() && len(fsrv.IndexNames) > 0 {
 		for _, indexPage := range fsrv.IndexNames {
-			indexPath := sanitizedPathJoin(filename, indexPage)
+			indexPath := caddyhttp.SanitizedPathJoin(filename, indexPage)
 			if fileHidden(indexPath, filesToHide) {
 				// pretend this file doesn't exist
 				fsrv.logger.Debug("hiding index file",
@@ -262,12 +245,26 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// trailing slash - not enforcing this can break relative hrefs
 	// in HTML (see https://github.com/caddyserver/caddy/issues/2741)
 	if fsrv.CanonicalURIs == nil || *fsrv.CanonicalURIs {
-		if implicitIndexFile && !strings.HasSuffix(r.URL.Path, "/") {
-			fsrv.logger.Debug("redirecting to canonical URI (adding trailing slash for directory)", zap.String("path", r.URL.Path))
-			return redirect(w, r, r.URL.Path+"/")
-		} else if !implicitIndexFile && strings.HasSuffix(r.URL.Path, "/") {
-			fsrv.logger.Debug("redirecting to canonical URI (removing trailing slash for file)", zap.String("path", r.URL.Path))
-			return redirect(w, r, r.URL.Path[:len(r.URL.Path)-1])
+		// Only redirect if the last element of the path (the filename) was not
+		// rewritten; if the admin wanted to rewrite to the canonical path, they
+		// would have, and we have to be very careful not to introduce unwanted
+		// redirects and especially redirect loops!
+		// See https://github.com/caddyserver/caddy/issues/4205.
+		origReq := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
+		if path.Base(origReq.URL.Path) == path.Base(r.URL.Path) {
+			if implicitIndexFile && !strings.HasSuffix(origReq.URL.Path, "/") {
+				to := origReq.URL.Path + "/"
+				fsrv.logger.Debug("redirecting to canonical URI (adding trailing slash for directory)",
+					zap.String("from_path", origReq.URL.Path),
+					zap.String("to_path", to))
+				return redirect(w, r, to)
+			} else if !implicitIndexFile && strings.HasSuffix(origReq.URL.Path, "/") {
+				to := origReq.URL.Path[:len(origReq.URL.Path)-1]
+				fsrv.logger.Debug("redirecting to canonical URI (removing trailing slash for file)",
+					zap.String("from_path", origReq.URL.Path),
+					zap.String("to_path", to))
+				return redirect(w, r, to)
+			}
 		}
 	}
 
@@ -333,32 +330,33 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 
-	// if this handler exists in an error context (i.e. is
-	// part of a handler chain that is supposed to handle
-	// a previous error), we have to serve the content
-	// manually in order to write the correct status code
+	var statusCodeOverride int
+
+	// if this handler exists in an error context (i.e. is part of a
+	// handler chain that is supposed to handle a previous error),
+	// we should set status code to the one from the error instead
+	// of letting http.ServeContent set the default (usually 200)
 	if reqErr, ok := r.Context().Value(caddyhttp.ErrorCtxKey).(error); ok {
-		statusCode := http.StatusInternalServerError
+		statusCodeOverride = http.StatusInternalServerError
 		if handlerErr, ok := reqErr.(caddyhttp.HandlerError); ok {
 			if handlerErr.StatusCode > 0 {
-				statusCode = handlerErr.StatusCode
+				statusCodeOverride = handlerErr.StatusCode
 			}
 		}
-		w.WriteHeader(statusCode)
-		if r.Method != http.MethodHead {
-			_, _ = io.Copy(w, file)
-		}
-		return nil
 	}
 
-	// if a status code override is configured, write the status code
-	// before serving the file
+	// if a status code override is configured, run the replacer on it
 	if codeStr := fsrv.StatusCode.String(); codeStr != "" {
-		intVal, err := strconv.Atoi(repl.ReplaceAll(codeStr, ""))
+		statusCodeOverride, err = strconv.Atoi(repl.ReplaceAll(codeStr, ""))
 		if err != nil {
 			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
-		w.WriteHeader(intVal)
+	}
+
+	// if we do have an override from the previous two parts, then
+	// we wrap the response writer to intercept the WriteHeader call
+	if statusCodeOverride > 0 {
+		w = statusOverrideResponseWriter{ResponseWriter: w, code: statusCodeOverride}
 	}
 
 	// let the standard library do what it does best; note, however,
@@ -441,42 +439,6 @@ func (fsrv *FileServer) transformHidePaths(repl *caddy.Replacer) []string {
 	return hide
 }
 
-// sanitizedPathJoin performs filepath.Join(root, reqPath) that
-// is safe against directory traversal attacks. It uses logic
-// similar to that in the Go standard library, specifically
-// in the implementation of http.Dir. The root is assumed to
-// be a trusted path, but reqPath is not.
-func sanitizedPathJoin(root, reqPath string) string {
-	// TODO: Caddy 1 uses this:
-	// prevent absolute path access on Windows, e.g. http://localhost:5000/C:\Windows\notepad.exe
-	// if runtime.GOOS == "windows" && len(reqPath) > 0 && filepath.IsAbs(reqPath[1:]) {
-	// TODO.
-	// }
-
-	// TODO: whereas std lib's http.Dir.Open() uses this:
-	// if filepath.Separator != '/' && strings.ContainsRune(name, filepath.Separator) {
-	// 	return nil, errors.New("http: invalid character in file path")
-	// }
-
-	// TODO: see https://play.golang.org/p/oh77BiVQFti for another thing to consider
-
-	if root == "" {
-		root = "."
-	}
-
-	path := filepath.Join(root, filepath.Clean("/"+reqPath))
-
-	// filepath.Join also cleans the path, and cleaning strips
-	// the trailing slash, so we need to re-add it afterwards.
-	// if the length is 1, then it's a path to the root,
-	// and that should return ".", so we don't append the separator.
-	if strings.HasSuffix(reqPath, "/") && len(reqPath) > 1 {
-		path += separator
-	}
-
-	return path
-}
-
 // fileHidden returns true if filename is hidden according to the hide list.
 // filename must be a relative or absolute file system path, not a request
 // URI path. It is expected that all the paths in the hide list are absolute
@@ -557,13 +519,21 @@ func redirect(w http.ResponseWriter, r *http.Request, to string) error {
 	return nil
 }
 
-var defaultIndexNames = []string{"index.html", "index.txt"}
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
+// statusOverrideResponseWriter intercepts WriteHeader calls
+// to instead write the HTTP status code we want instead
+// of the one http.ServeContent will use by default (usually 200)
+type statusOverrideResponseWriter struct {
+	http.ResponseWriter
+	code int
 }
+
+// WriteHeader intercepts calls by the stdlib to WriteHeader
+// to instead write the HTTP status code we want.
+func (wr statusOverrideResponseWriter) WriteHeader(int) {
+	wr.ResponseWriter.WriteHeader(wr.code)
+}
+
+var defaultIndexNames = []string{"index.html", "index.txt"}
 
 const (
 	minBackoff, maxBackoff = 2, 5

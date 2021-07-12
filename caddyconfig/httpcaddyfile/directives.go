@@ -265,6 +265,13 @@ func (h Helper) NewBindAddresses(addrs []string) []ConfigValue {
 	return []ConfigValue{{Class: "bind", Value: addrs}}
 }
 
+// WithDispenser returns a new instance based on d. All others Helper
+// fields are copied, so typically maps are shared with this new instance.
+func (h Helper) WithDispenser(d *caddyfile.Dispenser) Helper {
+	h.Dispenser = d
+	return h
+}
+
 // ParseSegmentAsSubroute parses the segment such that its subdirectives
 // are themselves treated as directives, from which a subroute is built
 // and returned.
@@ -458,6 +465,27 @@ func (sb serverBlock) hostsFromKeys(loggerMode bool) []string {
 			addr.Port != strconv.Itoa(caddyhttp.DefaultHTTPSPort) {
 			hostMap[net.JoinHostPort(addr.Host, addr.Port)] = struct{}{}
 		} else {
+			hostMap[addr.Host] = struct{}{}
+		}
+	}
+
+	// convert map to slice
+	sblockHosts := make([]string, 0, len(hostMap))
+	for host := range hostMap {
+		sblockHosts = append(sblockHosts, host)
+	}
+
+	return sblockHosts
+}
+
+func (sb serverBlock) hostsFromKeysNotHTTP(httpPort string) []string {
+	// ensure each entry in our list is unique
+	hostMap := make(map[string]struct{})
+	for _, addr := range sb.keys {
+		if addr.Host == "" {
+			continue
+		}
+		if addr.Scheme != "http" && addr.Port != httpPort {
 			hostMap[addr.Host] = struct{}{}
 		}
 	}

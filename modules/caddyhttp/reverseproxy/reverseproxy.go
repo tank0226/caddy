@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 	"go.uber.org/zap"
@@ -119,13 +120,20 @@ type Handler struct {
 	// handler chain will not affect the health status of the
 	// backend.
 	//
-	// Two new placeholders are available in this handler chain:
-	// - `{http.reverse_proxy.status_code}` The status code
-	// - `{http.reverse_proxy.status_text}` The status text
+	// Three new placeholders are available in this handler chain:
+	// - `{http.reverse_proxy.status_code}` The status code from the response
+	// - `{http.reverse_proxy.status_text}` The status text from the response
+	// - `{http.reverse_proxy.header.*}` The headers from the response
 	HandleResponse []caddyhttp.ResponseHandler `json:"handle_response,omitempty"`
 
 	Transport http.RoundTripper `json:"-"`
 	CB        CircuitBreaker    `json:"-"`
+
+	// Holds the named response matchers from the Caddyfile while adapting
+	responseMatchers map[string]caddyhttp.ResponseMatcher
+
+	// Holds the handle_response Caddyfile tokens while adapting
+	handleResponseSegments []*caddyfile.Dispenser
 
 	ctx    caddy.Context
 	logger *zap.Logger
@@ -196,7 +204,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			KeepAlive: &KeepAlive{
 				ProbeInterval:       caddy.Duration(30 * time.Second),
 				IdleConnTimeout:     caddy.Duration(2 * time.Minute),
-				MaxIdleConnsPerHost: 32,
+				MaxIdleConnsPerHost: 32, // seems about optimal, see #2805
 			},
 			DialTimeout: caddy.Duration(10 * time.Second),
 		}
@@ -496,18 +504,14 @@ func (h Handler) prepareRequest(req *http.Request) error {
 	// Remove hop-by-hop headers to the backend. Especially
 	// important is "Connection" because we want a persistent
 	// connection, regardless of what the client sent to us.
+	// Issue golang/go#46313: don't skip if field is empty.
 	for _, h := range hopHeaders {
-		hv := req.Header.Get(h)
-		if hv == "" {
-			continue
-		}
-		if h == "Te" && hv == "trailers" {
-			// Issue golang/go#21096: tell backend applications that
-			// care about trailer support that we support
-			// trailers. (We do, but we don't go out of
-			// our way to advertise that unless the
-			// incoming client request thought it was
-			// worth mentioning)
+		// Issue golang/go#21096: tell backend applications that care about trailer support
+		// that we support trailers. (We do, but we don't go out of our way to
+		// advertise that unless the incoming client request thought it was worth
+		// mentioning.)
+		if h == "Te" && httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
+			req.Header.Set("Te", "trailers")
 			continue
 		}
 		req.Header.Del(h)
@@ -561,9 +565,11 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *
 	logger := h.logger.With(
 		zap.String("upstream", di.Upstream.String()),
 		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: req}),
-		zap.Duration("duration", duration))
+	)
 	if err != nil {
-		logger.Debug("upstream roundtrip", zap.Error(err))
+		logger.Debug("upstream roundtrip",
+			zap.Duration("duration", duration),
+			zap.Error(err))
 		return err
 	}
 	logger.Debug("upstream roundtrip",
@@ -622,9 +628,17 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *
 		if len(rh.Routes) == 0 {
 			continue
 		}
+
 		res.Body.Close()
+
+		// set up the replacer so that parts of the original response can be
+		// used for routing decisions
+		for field, value := range res.Header {
+			repl.Set("http.reverse_proxy.header."+field, strings.Join(value, ","))
+		}
 		repl.Set("http.reverse_proxy.status_code", res.StatusCode)
 		repl.Set("http.reverse_proxy.status_text", res.Status)
+
 		h.logger.Debug("handling response", zap.Int("handler", i))
 		if routeErr := rh.Routes.Compile(next).ServeHTTP(rw, req); routeErr != nil {
 			// wrap error in roundtripSucceeded so caller knows that
@@ -635,7 +649,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *
 
 	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
-		h.handleUpgradeResponse(rw, req, res)
+		h.handleUpgradeResponse(logger, rw, req, res)
 		return nil
 	}
 
